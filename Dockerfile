@@ -1,48 +1,69 @@
 FROM alpine:latest
 
-# Install icecast and ezstream
-RUN apk add --no-cache icecast ezstream
+# Install Node.js
+RUN apk add --no-cache nodejs npm
 
-# Create required folder structures
-RUN mkdir -p /etc/icecast /etc/ezstream /usr/local/icecast/logs
+WORKDIR /app
 
-# Generate Icecast Configuration (Logging to stdout to prevent file writing errors)
-RUN echo '<icecast> \
-    <limits><clients>100</clients><sources>2</sources></limits> \
-    <authentication> \
-        <source-password>hackme</source-password> \
-        <admin-user>admin</admin-user> \
-        <admin-password>hackme</admin-password> \
-    </authentication> \
-    <listen-socket><port>8000</port></listen-socket> \
-    <http-headers><header name="Access-Control-Allow-Origin" value="*"/></http-headers> \
-    <logging> \
-        <accesslog>-</accesslog> \
-        <errorlog>-</errorlog> \
-        <loglevel>3</loglevel> \
-    </logging> \
-</icecast>' > /etc/icecast/icecast.xml
+# Create server files directly inside the building step
+RUN echo '{ \
+  "name": "radio", \
+  "version": "1.0.0", \
+  "main": "server.js", \
+  "dependencies": { \
+    "axios": "^1.6.0" \
+  } \
+}' > package.json
 
-# Generate Ezstream Configuration
-RUN echo '<ezstream> \
-    <url>http://127.0.0</url> \
-    <sourcepassword>hackme</sourcepassword> \
-    <format>MP3</format> \
-    <filename>/etc/ezstream/playlist.txt</filename> \
-    <shuffle>0</shuffle> \
-    <playlist_program>0</playlist_program> \
-    <stream_once>0</stream_once> \
-</ezstream>' > /etc/ezstream/ezstream.xml
+RUN npm install
+
+# Write an advanced streaming script directly to the build context
+RUN echo "const http = require('http'); \n\
+const fs = require('fs'); \n\
+const axios = require('axios'); \n\
+const PORT = process.env.PORT || 8000; \n\
+let listeners = []; \n\
+let playlist = []; \n\
+let currentTrackIndex = 0; \n\
+try { \n\
+    playlist = fs.readFileSync('playlist.txt', 'utf-8').split('\\\n').map(line => line.trim()).filter(Boolean); \n\
+    console.log('Loaded ' + playlist.length + ' songs.'); \n\
+} catch (err) { console.error('Playlist file missing!', err); } \n\
+async function startRadio() { \n\
+    if (playlist.length === 0) return; \n\
+    while (true) { \n\
+        const url = playlist[currentTrackIndex]; \n\
+        console.log('Broadcasting: ' + url); \n\
+        try { \n\
+            const response = await axios({ method: 'get', url: url, responseType: 'stream' }); \n\
+            await new Promise((resolve) => { \n\
+                response.data.on('data', (chunk) => { \n\
+                    listeners.forEach(res => { try { res.write(chunk); } catch(e){} }); \n\
+                }); \n\
+                response.data.on('end', resolve); \n\
+                response.data.on('error', resolve); \n\
+            }); \n\
+        } catch (err) { console.error('Error on link: ' + url); } \n\
+        currentTrackIndex = (currentTrackIndex + 1) % playlist.length; \n\
+        await new Promise(r => setTimeout(r, 1000)); \n\
+    } \n\
+} \n\
+const server = http.createServer((req, res) => { \n\
+    res.writeHead(200, { \n\
+        'Content-Type': 'audio/mpeg', \n\
+        'Transfer-Encoding': 'chunked', \n\
+        'Connection': 'keep-alive', \n\
+        'Cache-Control': 'no-cache, no-store', \n\
+        'Access-Control-Allow-Origin': '*' \n\
+    }); \n\
+    listeners.push(res); \n\
+    req.on('close', () => { listeners = listeners.filter(l => l !== res); }); \n\
+}); \n\
+server.listen(PORT, () => { console.log('Radio online on ' + PORT); startRadio(); });" > server.js
+
+# Copy your playlist.txt directly into the container folder
+COPY playlist.txt ./playlist.txt
 
 EXPOSE 8000
 
-# Copy your playlist file into the container
-COPY playlist.txt /etc/ezstream/playlist.txt
-
-# FIX SECURITY: Tighten permissions so Ezstream doesn't complain about "world readable"
-RUN chmod 600 /etc/ezstream/ezstream.xml /etc/icecast/icecast.xml
-
-# Start Icecast first, wait, then spin up Ezstream
-CMD icecast -c /etc/icecast/icecast.xml & \
-    sleep 2 && \
-    ezstream -c /etc/ezstream/ezstream.xml
+CMD ["node", "server.js"]
